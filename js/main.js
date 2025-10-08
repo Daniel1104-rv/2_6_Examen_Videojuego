@@ -8,9 +8,11 @@ import { Capsule } from 'three/addons/math/Capsule.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 
 /* ===================== Config rápida de rendimiento ===================== */
-const FAST_MODE = true;          // true = no crea PointLights/Sprites por pelota (gran boost)
-const MAX_PIXEL_RATIO = 1.0;     // limita la resolución para evitar picos
-const SHADOW_MAP_SIZE = 512;     // 512 es bastante más ligero que 1024
+const FAST_MODE = true;          
+const MAX_PIXEL_RATIO = 1.0;     
+const SHADOW_MAP_SIZE = 512;     
+const MIXER_DT_CAP = 1/30;       
+const START_SAFE_TIME = 1.5;     
 
 /* ===================== Scene, Camera, Renderer ===================== */
 const clock = new THREE.Clock();
@@ -63,7 +65,7 @@ scene.add(sun);
 
 /* ===== Renderer / Stats ===== */
 const container = document.getElementById('container');
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(MAX_PIXEL_RATIO, window.devicePixelRatio));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setAnimationLoop(animate);
@@ -173,7 +175,7 @@ for (let i = 0; i < NUM_SPHERES; i++) {
 
 /* ===================== World GLTF ===================== */
 let worldScene = null;
-let worldBounds = null; // para spawns globales
+let worldBounds = null; 
 const gltfLoader = new GLTFLoader().setPath('./models/gltf/');
 gltfLoader.load('squid_game_hide_and_seek.glb', (gltf) => {
   scene.add(gltf.scene);
@@ -188,7 +190,6 @@ gltfLoader.load('squid_game_hide_and_seek.glb', (gltf) => {
     }
   });
 
-  // bounds globales del escenario
   worldBounds = new THREE.Box3().setFromObject(gltf.scene);
 
   const helper = new OctreeHelper(worldOctree);
@@ -196,6 +197,8 @@ gltfLoader.load('squid_game_hide_and_seek.glb', (gltf) => {
   scene.add(helper);
 
   new GUI({ width:200 }).add({ debug:false }, 'debug').onChange(v => helper.visible = v);
+
+  try { renderer.compile(scene, camera); } catch(e){}
 });
 
 /* ===================== Input ===================== */
@@ -237,7 +240,7 @@ controlsHint.textContent = 'WASD: mover | MOUSE: mirar/lanza | SPACE: saltar | R
 document.body.appendChild(controlsHint);
 
 /* ===================== NPCs (caminar + emotes) ===================== */
-const NPC_IDLE = 'Walking'; // <-- ahora Walking.fbx
+const NPC_IDLE = 'Walking';
 const EMOTE_LIST = [
   'Reaction','Sitting Clap','Hip Hop Dancing','Jumping Down','Praying','Rumba Dancing','Dying'
 ];
@@ -246,9 +249,9 @@ const NPC_TARGET_HEIGHT = 1.25;
 /* —— Densidad global y anti-cluster —— */
 const NPC_MAX = 8;
 const NPC_MIN_DIST_BETWEEN = 2.25;
-const CELL_SIZE = 6;              // tamaño de celda ~6m
-const CELL_MAX = 2;               // máximo 2 NPC por celda
-const cellCounts = new Map();     // "ix,iz" -> count
+const CELL_SIZE = 6;              
+const CELL_MAX = 2;               
+const cellCounts = new Map();     
 
 function cellKey(pos){
   const ix = Math.floor(pos.x / CELL_SIZE);
@@ -274,9 +277,9 @@ const NPC_LOCAL_MAX = 3;
 const NPC_SPAWN_DISTANCE = { min: 4, max: 10 };
 
 // --- Persecución y derrota
-const NPC_BASE_SPEED = 0.9;           // velocidad base de caminata
-const NPC_CHASE_BOOST = 0.6;          // cuanto más rápido cuando te ven
-const NPC_LOSE_DISTANCE = 0.9;        // distancia para perder
+const NPC_BASE_SPEED = 0.9;           
+const NPC_CHASE_BOOST = 0.6;          
+const NPC_LOSE_DISTANCE = 0.9;        
 
 const NPCS = [];
 const fbxLoader = new FBXLoader();
@@ -336,21 +339,31 @@ function ceilingClearanceAt(point) {
 }
 
 /* ======= Helpers de colisión/unstuck para NPC ======= */
-function npcCollisionSphere(npc){
-  // esfera a la altura del torso/piernas
-  const center = npc.group.position.clone().add(new THREE.Vector3(0, 0.6, 0));
-  const r = Math.max(0.28, Math.min(0.45, npc.radius * 0.35));
-  return new THREE.Sphere(center, r);
+function npcMultiSpheresAt(pos, baseRadius){
+  const r = Math.max(0.28, Math.min(0.48, baseRadius * 0.35));
+  return [
+    new THREE.Sphere(pos.clone().add(new THREE.Vector3(0, 0.35, 0)), r),
+    new THREE.Sphere(pos.clone().add(new THREE.Vector3(0, 0.95, 0)), r*0.95),
+  ];
 }
-function resolveNPCCollision(npc){
-  const sph = npcCollisionSphere(npc);
-  const hit = worldOctree.sphereIntersect(sph);
-  if (hit){
-    // saca al NPC de la pared con un pequeño margen
-    npc.group.position.add(hit.normal.multiplyScalar(hit.depth + 0.02));
-    return true;
+function pushOutFromWorld(pos, baseRadius, iters=6, extra=0.04){
+  let moved = false;
+  for (let k=0;k<iters;k++){
+    let pushed = false;
+    const spheres = npcMultiSpheresAt(pos, baseRadius);
+    for (const sph of spheres){
+      const hit = worldOctree.sphereIntersect(sph);
+      if (hit){
+        pos.add(hit.normal.multiplyScalar(hit.depth + extra));
+        pushed = true; moved = true;
+      }
+    }
+    if (!pushed) break;
   }
-  return false;
+  return moved;
+}
+function resolveNPCCollision(npc, iters=3){
+  return pushOutFromWorld(npc.group.position, npc.radius, iters);
 }
 function recentreInCorridor(npc, dirHint){
   const dir = dirHint ? dirHint.clone() : new THREE.Vector3(0,0,1);
@@ -358,7 +371,7 @@ function recentreInCorridor(npc, dirHint){
   const dR = castHorizontalDistance(npc.group.position, sideR, 2.0);
   const dL = castHorizontalDistance(npc.group.position, sideR.clone().multiplyScalar(-1), 2.0);
   const offset = THREE.MathUtils.clamp((dR - dL) * 0.35, -0.6, 0.6);
-  npc.group.position.add(sideR.multiplyScalar(offset * 0.25)); // ajuste suave
+  npc.group.position.add(sideR.multiplyScalar(offset * 0.25));
 }
 
 /* === Anti-cluster local === */
@@ -375,7 +388,6 @@ function isTooCrowded(pos){
 function spawnAtPosition(basePos, forwardHint){
   if (!worldScene || gameOver || NPCS.length >= NPC_MAX) return false;
 
-  // centra en pasillo
   const sideDir = getSideVector().clone();
   const MAX_CORRIDOR_HALF = 3.0;
   const minClearSide = 0.5;
@@ -386,21 +398,27 @@ function spawnAtPosition(basePos, forwardHint){
 
   const lateralOffset = THREE.MathUtils.clamp((dRight - dLeft) * 0.5, -MAX_CORRIDOR_HALF, MAX_CORRIDOR_HALF);
   const centeredXZ = basePos.clone().add(sideDir.multiplyScalar(lateralOffset));
-  const centeredFloor = floorAtXZ(centeredXZ.x, centeredXZ.z);
-  if (!centeredFloor) return false;
-  if (ceilingClearanceAt(centeredFloor) < 1.7) return false;
+  let finalPos = floorAtXZ(centeredXZ.x, centeredXZ.z);
+  if (!finalPos) return false;
+  if (ceilingClearanceAt(finalPos) < 1.7) return false;
 
   for (const n of NPCS){
-    if (n.group.position.distanceTo(centeredFloor) < NPC_MIN_DIST_BETWEEN) return false;
+    if (n.group.position.distanceTo(finalPos) < NPC_MIN_DIST_BETWEEN) return false;
   }
-  if (isTooCrowded(centeredFloor)) return false;
+  if (isTooCrowded(finalPos)) return false;
 
-  // crea
+  pushOutFromWorld(finalPos, 1.0, 6, 0.06);
+  const sideR = new THREE.Vector3(sideDir.z, 0, -sideDir.x);
+  const dR = castHorizontalDistance(finalPos, sideR, 1.5);
+  const dL = castHorizontalDistance(finalPos, sideR.clone().multiplyScalar(-1), 1.5);
+  const lateralNudge = THREE.MathUtils.clamp((dR - dL) * 0.25, -0.4, 0.4);
+  finalPos.add(sideR.multiplyScalar(lateralNudge * 0.5));
+
   loadFBX(`./models/fbx/${NPC_IDLE}.fbx`).then((fbx)=>{
     const group = fbx;
     group.traverse((c)=>{ if (c.isMesh){ c.castShadow = true; c.receiveShadow = true; }});
     fitToHeight(group, NPC_TARGET_HEIGHT);
-    group.position.copy(centeredFloor).add(new THREE.Vector3(0, 0.01, 0)); // toca suelo
+    group.position.copy(finalPos).add(new THREE.Vector3(0, 0.01, 0));
 
     const dir = forwardHint ? forwardHint.clone().setY(0).normalize() : getForwardVector().clone();
     group.rotation.y = Math.atan2(dir.x, dir.z);
@@ -410,7 +428,6 @@ function spawnAtPosition(basePos, forwardHint){
     let idleAction = null;
     if (fbx.animations?.length){
       idleAction = mixer.clipAction(fbx.animations[0], group);
-      // 🔁 camina SIN parar
       idleAction.setLoop(THREE.LoopRepeat, Infinity);
       idleAction.clampWhenFinished = false;
       idleAction.enabled = true;
@@ -438,13 +455,9 @@ function spawnAtPosition(basePos, forwardHint){
       _lastPos: group.position.clone()
     };
 
-    // Intento de "despegar" si por algún detalle de malla quedó tocando pared
-    let safetyIters = 0;
-    while (resolveNPCCollision(npc) && safetyIters++ < 4) {}
-    // Si aún así chocó techo/pareces, recentrar un poco
+    resolveNPCCollision(npc, 6);
     recentreInCorridor(npc, dir);
 
-    // anti-cluster por celda (usa posición final)
     if (!cellCanAdd(npc.group.position)){
       scene.remove(group);
       return;
@@ -556,11 +569,43 @@ function teleportPlayerIfOob(){
   }
 }
 
-/* ===================== Score & Timer ===================== */
+/* ===================== Score, Timer & Vidas ===================== */
 let score = 0;
 const WIN_KILLS = 10;
-const GAME_DURATION = 180; // 3 minutos
+const GAME_DURATION = 180;
 let timeLeft = GAME_DURATION;
+
+const MAX_LIVES = 3;
+let lives = MAX_LIVES;
+let playerHitCooldown = START_SAFE_TIME;
+const PLAYER_HIT_COOLDOWN_SECS = 1.1;
+
+/* --- Overlay/feedback de golpe --- */
+const hurtOverlay = document.createElement('div');
+hurtOverlay.style.cssText = `
+  position:fixed; inset:0; pointer-events:none; z-index:20;
+  background: radial-gradient(ellipse at center, rgba(255,0,0,0.5) 0%, rgba(255,0,0,0.35) 35%, rgba(255,0,0,0.12) 60%, rgba(0,0,0,0) 75%);
+  opacity:0; transition: opacity .25s ease-out;
+  mix-blend-mode: screen;
+`;
+document.body.appendChild(hurtOverlay);
+
+let shakeTime = 0;    // tiempo restante de sacudida
+let shakeAmp  = 0;    // amplitud actual
+
+function playerHitFeedback(){
+  // flash rojo
+  hurtOverlay.style.transition = 'none';
+  hurtOverlay.style.opacity = '0.95';
+  // forzar reflow y dejar que el CSS haga fade
+  void hurtOverlay.offsetWidth;
+  hurtOverlay.style.transition = 'opacity .35s ease-out';
+  hurtOverlay.style.opacity = '0';
+
+  // sacudida
+  shakeTime = 0.35;
+  shakeAmp = 0.15; // rad para rotación + ~0.05m para posición
+}
 
 const hudKills = document.createElement('div');
 hudKills.style.cssText = `
@@ -570,6 +615,15 @@ hudKills.style.cssText = `
 `;
 hudKills.textContent = 'Kills: 0 / 10';
 document.body.appendChild(hudKills);
+
+const hudLives = document.createElement('div');
+hudLives.style.cssText = `
+  position:fixed; right:12px; top:200px; z-index:11;
+  font-family:system-ui,-apple-system,Segoe UI,Roboto; font-weight:700;
+  color:#fff; text-shadow:0 2px 4px rgba(0,0,0,.6); font-size:18px;
+`;
+hudLives.textContent = `Vidas: ${lives} / ${MAX_LIVES}`;
+document.body.appendChild(hudLives);
 
 const hudTimer = document.createElement('div');
 hudTimer.style.cssText = `
@@ -619,7 +673,10 @@ function endGame(message){
 function requestRestart(){
   score = 0;
   timeLeft = GAME_DURATION;
+  lives = MAX_LIVES;
+  playerHitCooldown = START_SAFE_TIME;
   hudKills.textContent = `Kills: ${score} / ${WIN_KILLS}`;
+  hudLives.textContent = `Vidas: ${lives} / ${MAX_LIVES}`;
   hudTimer.textContent = formatTime(timeLeft);
   gameOver = false;
   youWon = false;
@@ -817,11 +874,28 @@ function updateSpheres(dt){
 }
 
 /* ===================== NPC walking + cleanup ===================== */
+function hasLineOfSightToPlayer(fromPos){
+  if (!worldScene) return true;
+  const eyeFrom = fromPos.clone().add(new THREE.Vector3(0, 1.0, 0));
+  const to = playerCollider.end.clone();
+  const dir = to.clone().sub(eyeFrom);
+  const dist = dir.length();
+  if (dist < 1e-3) return true;
+  dir.divideScalar(dist);
+  raycaster.set(eyeFrom, dir);
+  raycaster.far = dist - 0.1;
+  const hit = raycaster.intersectObject(worldScene, true)[0];
+  return !hit;
+}
+
+let safeTimeLeft = START_SAFE_TIME; 
+
 function updateNPCs(dt){
   if (!gameOver){
     spawnCooldown -= dt;
     const movingForward = keyStates['KeyW'] || playerVelocity.length() > 0.15;
-    if (spawnCooldown <= 0) {
+    const canSpawn = safeTimeLeft <= 0;
+    if (spawnCooldown <= 0 && canSpawn) {
       const ok =
         (movingForward && spawnNPCAhead()) ||
         spawnNPCInRing() ||
@@ -836,12 +910,10 @@ function updateNPCs(dt){
     const npc = NPCS[i];
 
     if (npc.state === 'idle') {
-      // ====== Perseguir al jugador (seek) ======
       const toPlayer = playerPos.clone().sub(npc.group.position).setY(0);
       const distToPlayer = toPlayer.length();
       if (distToPlayer > 0.001) toPlayer.normalize();
 
-      // Mantenerse centrados en el pasillo
       npc.senseTimer -= dt;
       if (npc.senseTimer <= 0) {
         const sideRight = new THREE.Vector3(toPlayer.z, 0, -toPlayer.x);
@@ -851,7 +923,6 @@ function updateNPCs(dt){
         npc.senseTimer = 0.18 + Math.random()*0.08;
       }
 
-      // Evitar pared frontal (gira)
       const fwdDist = castHorizontalDistance(npc.group.position, toPlayer, 0.9);
       if (fwdDist < 0.35) {
         const right = new THREE.Vector3(toPlayer.z, 0, -toPlayer.x);
@@ -861,37 +932,44 @@ function updateNPCs(dt){
         toPlayer.copy(dR > dL ? right : left).normalize();
       }
 
-      // Velocidad: base + boost si te tiene a la vista
       const speed = npc.speed + (NPC_CHASE_BOOST * Math.min(1, 10/(1+distToPlayer)));
 
-      // Movimiento (hacia ti + centrado)
       const sideRight = new THREE.Vector3(toPlayer.z, 0, -toPlayer.x);
       const lateral = sideRight.multiplyScalar(npc._lateralOffset || 0);
       const move = toPlayer.clone().multiplyScalar(speed * dt).add(lateral.multiplyScalar(dt));
       const nextXZ = npc.group.position.clone().add(move);
 
       const p = floorAtXZ(nextXZ.x, nextXZ.z) || floorAtXZ(npc.group.position.x, npc.group.position.z);
-      if (p) npc.group.position.copy(p);
-
-      npc.group.rotation.y = Math.atan2(toPlayer.x, toPlayer.z);
-
-      // Perder si te alcanzan
-      if (!gameOver && distToPlayer <= NPC_LOSE_DISTANCE){
-        endGame('¡TE ATRAPARON!');
-      }
-
-      // ---------- Unstuck runtime ----------
-      // 1) Corrige penetración si existe
-      const collided = resolveNPCCollision(npc);
-      if (collided) {
+      if (p){
+        pushOutFromWorld(p, npc.radius, 3, 0.04);
+        npc.group.position.copy(p);
         recentreInCorridor(npc, toPlayer);
       }
 
-      // 2) Detecta si casi no avanzó en 0.6s => girar y empujar
+      npc.group.rotation.y = Math.atan2(toPlayer.x, toPlayer.z);
+
+      if (!gameOver && distToPlayer <= NPC_LOSE_DISTANCE){
+        if (playerHitCooldown <= 0 && hasLineOfSightToPlayer(npc.group.position)){
+          lives = Math.max(0, lives - 1);
+          hudLives.textContent = `Vidas: ${lives} / ${MAX_LIVES}`;
+          playerHitCooldown = PLAYER_HIT_COOLDOWN_SECS;
+          // feedback visual/temblor
+          playerHitFeedback();
+
+          const knock = toPlayer.clone().negate().multiplyScalar(6);
+          playerVelocity.add(knock);
+          if (lives <= 0){
+            endGame('¡TE ATRAPARON!');
+          }
+        }
+      }
+
+      const collided = resolveNPCCollision(npc, 2);
+      if (collided) recentreInCorridor(npc, toPlayer);
+
       const moved = npc._lastPos.distanceToSquared(npc.group.position);
       if (moved < 0.0009) npc._stuckTime += dt; else npc._stuckTime = 0;
       if (npc._stuckTime > 0.6){
-        // gira 60–120 grados y empuja al centro
         const angle = THREE.MathUtils.degToRad(60 + Math.random()*60) * (Math.random()<0.5?-1:1);
         toPlayer.applyAxisAngle(new THREE.Vector3(0,1,0), angle).normalize();
         npc.group.rotation.y = Math.atan2(toPlayer.x, toPlayer.z);
@@ -902,9 +980,8 @@ function updateNPCs(dt){
       npc._lastPos.copy(npc.group.position);
     }
 
-    if (npc.mixer) npc.mixer.update(dt);
+    if (npc.mixer) npc.mixer.update(Math.min(dt, MIXER_DT_CAP));
 
-    // Solo descontar TTL si está "dead"
     if (npc.state !== 'idle') npc.ttl -= dt;
 
     if (npc._flashLight){
@@ -1003,6 +1080,9 @@ function animate(){
     }
   }
 
+  if (playerHitCooldown > 0) playerHitCooldown -= rawDt;
+  if (safeTimeLeft > 0) safeTimeLeft -= rawDt;
+
   const dt = Math.min(0.05, rawDt) / STEPS_PER_FRAME;
 
   for (let i=0;i<STEPS_PER_FRAME;i++){
@@ -1013,9 +1093,21 @@ function animate(){
     teleportPlayerIfOob();
   }
 
+  // aplicar sacudida de cámara después de actualizar posiciones
+  if (shakeTime > 0){
+    const t = shakeTime;
+    const falloff = t / 0.35; // decae hacia 0
+    const ampPos = 0.05 * falloff;
+    const ampRot = shakeAmp * falloff;
+    const nx = (Math.random()-0.5), ny = (Math.random()-0.5), nz = (Math.random()-0.5);
+    camera.position.add(new THREE.Vector3(nx, ny, nz).multiplyScalar(ampPos));
+    camera.rotation.x += (Math.random()-0.5) * ampRot;
+    camera.rotation.y += (Math.random()-0.5) * ampRot * 0.6;
+    shakeTime -= rawDt;
+  }
+
   renderer.render(scene, camera);
   stats.update();
 
   if ((_radarFrame++ & 1) === 0) drawRadar();
 }
-
